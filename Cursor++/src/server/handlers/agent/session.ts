@@ -2,7 +2,7 @@
  * Agent Session 管理
  *
  * SSE 降级模式下，Client 通过两个独立通道通信:
- *   - BidiAppend (unary) — 发送 AgentClientMessage (data=base64 proto)
+ *   - BidiAppend (unary) — 发送 AgentClientMessage (field 1 hex 或 field 4 原始字节)
  *   - RunSSE (server_streaming) — 接收 AgentServerMessage 流
  *
  * 两者通过 requestId 关联。Session 维护一个 per-requestId 的消息队列，
@@ -184,21 +184,35 @@ export function getOrCreateSession(requestId: string): AgentSession {
     return session;
 }
 
-/** BidiAppend 调用时，将消息推入 session 队列 */
-export function appendMessage(requestId: string, data: string): void {
-    const session = getOrCreateSession(requestId);
+/**
+ * BidiAppend 调用时，将消息推入 session 队列。
+ *
+ * data 有两种来源 (见 services/core/BidiService.resolveAppendPayload):
+ *   - string     — 旧版客户端的 field 1，protobuf binary 的 hex 字符串
+ *   - Uint8Array — Cursor 3.29+ 的 field 4，原始 protobuf binary
+ * 直接解码 bytes，避免 data_binary 走一次 bytes → hex → bytes 的无谓往返。
+ */
+export function appendMessage(requestId: string, data: Uint8Array | string, seqno?: number): void {
+    const bytes = typeof data === 'string' ? Buffer.from(data, 'hex') : data;
+    if (bytes.length === 0) {
+        logger.warn({ requestId, seqno }, '[SESSION] empty AgentClientMessage');
+        return;
+    }
 
-    // data 是 proto string 类型，实际承载的是 protobuf binary 的 hex 字符串表示。
-    // "0ad88200a00012..." → hex decode → protobuf bytes
     try {
-        const bytes = Buffer.from(data, 'hex');
         const clientMsg = fromBinary(AgentClientMessageSchema, bytes);
         const json = toJson(AgentClientMessageSchema, clientMsg) as Record<string, unknown>;
         const keys = Object.keys(json);
-        logger.info({ requestId, keys, protoBytes: bytes.length }, '[SESSION] appendMessage');
-        ingestSessionMessage(session, json);
+        // 只含 unknown fields 的载荷会被 protobuf-es 解析成空消息。入队后
+        // waitForMessage 会把它当成"首条消息"消费掉，业务层随后才失败。
+        if (keys.length === 0) {
+            logger.warn({ requestId, protoBytes: bytes.length, seqno }, '[SESSION] empty AgentClientMessage');
+            return;
+        }
+        logger.info({ requestId, keys, protoBytes: bytes.length, seqno }, '[SESSION] appendMessage');
+        ingestSessionMessage(getOrCreateSession(requestId), json);
     } catch (e) {
-        logger.warn({ requestId, dataLen: data.length, error: (e as Error).message }, '[SESSION] proto decode failed');
+        logger.warn({ requestId, protoBytes: bytes.length, seqno, error: (e as Error).message }, '[SESSION] proto decode failed');
     }
 }
 
