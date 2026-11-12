@@ -114,7 +114,7 @@ export function makeByokConnectError(opts: MakeByokErrorOptions): ConnectError {
 // ── 粗粒度工厂 ────────────────────────────────────────────────
 
 /**
- * LLM provider 调用层错误 (流中断 / 429 / 5xx / 协议错 / 鉴权错)。
+ * LLM provider 调用层错误 (流中断 / 429 / 5xx / 协议错 / 鉴权错 / 反爬挑战页)。
  *
  * 阶段 1 没有 ByokError 类层级, 也没在 provider 层做 HTTP status 判别,
  * 这里只能靠 **错误消息前缀的启发式匹配** 把观测到的 "retry 必然无效" 类
@@ -123,26 +123,92 @@ export function makeByokConnectError(opts: MakeByokErrorOptions): ConnectError {
  * 其他未识别的错保守默认可 retry, 这样图 30 (stream 断) 和 429/5xx 之类
  * 真正的 transient 错能一键恢复。
  *
+ * 反爬挑战页 (Vercel Security Checkpoint / Cloudflare 403 HTML) 是例外:
+ * 它带 403 但属于瞬时风控, 同一网关紧接着重试通常就恢复, 因此单独按可重试
+ * 处理; 同时把整页 HTML 压成摘要, 避免客户端把几万字符的混淆脚本渲染出来。
+ *
  * 这个启发式是临时方案, 阶段 2 会被 provider 层的 HTTP status 判断替代。
  */
 export function makeProviderError(cause: unknown, extra?: Record<string, string>): ConnectError {
-  const message = extractErrorMessage(cause)
-  const retryable = inferRetryable(message)
+  const rawMessage = extractErrorMessage(cause)
+  const antiBot = isAntiBotChallenge(rawMessage)
+  const retryable = antiBot || inferRetryable(rawMessage)
+  const message = summarizeProviderMessage(rawMessage)
   const errorCode = retryable
     ? ErrorDetails_Error.PROVIDER_ERROR
     : ErrorDetails_Error.CUSTOM
   return makeByokConnectError({
     errorCode,
-    title: retryable ? 'LLM provider error' : 'BYOK request rejected',
+    title: antiBot
+      ? 'Upstream gateway security check'
+      : retryable ? 'LLM provider error' : 'BYOK request rejected',
     detail: message,
     isRetryable: retryable,
     additionalInfo: {
       errorClass: getErrorClass(cause),
       retryableHint: retryable ? 'true' : 'false',
+      ...(antiBot ? { antiBotChallenge: 'true' } : {}),
       ...extra,
     },
     cause,
   })
+}
+
+/**
+ * 上游网关反爬挑战页的特征。
+ *
+ * 实测 (2026-11-12, Magpie 上游 Vercel): 403 + 21004 字符的
+ * "Vercel Security Checkpoint" 页面。原样塞进 ErrorDetails.detail 会让
+ * Cursor 把整段混淆 JS 渲染到对话里; 且 inferRetryable 看到 403 会判成
+ * 永久错, 用户连 "Try again" 都看不到。挑战页通常是瞬时的 (紧接着重试即
+ * 200), 所以必须单独识别。
+ */
+const ANTI_BOT_MARKERS = [
+  'vercel security checkpoint',
+  'cloudflare',
+  'just a moment',
+  'cf-chl',
+  'challenge-platform',
+]
+
+function hasHtmlBody(message: string): boolean {
+  return /<!doctype html|<html[\s>]/i.test(message)
+}
+
+function isAntiBotChallenge(message: string): boolean {
+  if (!hasHtmlBody(message))
+    return false
+  const lower = message.toLowerCase()
+  return ANTI_BOT_MARKERS.some(marker => lower.includes(marker))
+}
+
+/**
+ * 把上游返回的 HTML 错误页压成一句可读摘要。
+ *
+ * 保留 HTML 之前的调用链前缀 (哪一层、哪个模型、HTTP 状态), 丢掉整页
+ * 标记/脚本。非 HTML 错误原样返回, 不改变既有行为。
+ */
+function summarizeProviderMessage(message: string): string {
+  if (!hasHtmlBody(message))
+    return message
+
+  const htmlStart = message.search(/<!doctype html|<html[\s>]/i)
+  const prefix = (htmlStart > 0 ? message.slice(0, htmlStart) : '')
+    .trim()
+    .replace(/[:：]\s*$/, '')
+  const title = message.match(/<title>([^<]{1,120})<\/title>/i)?.[1]?.trim()
+  const status = message.match(/\bstatus\s*(\d{3})\b/i)?.[1]
+  const model = message.match(/invoke model '([^']+)'/i)?.[1]
+
+  const parts = [
+    prefix ? `${prefix}.` : '',
+    `Upstream gateway returned HTTP ${status ?? '4xx'} with ${title ? `a "${title}" page` : 'an HTML error page'}${model ? ` (model: ${model})` : ''}.`,
+    isAntiBotChallenge(message)
+      ? 'This is transient anti-bot protection — retry; if it persists, check the gateway or switch model.'
+      : 'The upstream returned HTML instead of an API error; check the gateway/model provider.',
+  ].filter(Boolean)
+
+  return parts.join(' ')
 }
 
 /**
